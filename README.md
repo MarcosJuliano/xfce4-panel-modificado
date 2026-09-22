@@ -3,6 +3,7 @@
 Customização do **xfce4-panel 4.18.4** para Linux/XFCE, baseada no código-fonte original do projeto XFCE.
 
 Este repositório mantém uma versão modificada do painel para uso pessoal, backup e documentação das alterações realizadas.
+(planejo fazer mais modificações no futuro)
 
 ## Modificação principal
 
