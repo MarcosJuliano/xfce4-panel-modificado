@@ -1,0 +1,823 @@
+diff --git a/panel/panel-window.c b/panel/panel-window.c
+index 5a94b17..8d9c89d 100644
+--- a/panel/panel-window.c
++++ b/panel/panel-window.c
+@@ -153,6 +153,8 @@ static void         panel_window_active_window_state_changed          (WnckWindo
+                                                                        PanelWindow      *window);
+ static void         panel_window_autohide_timeout_destroy             (gpointer          user_data);
+ static void         panel_window_autohide_ease_out_timeout_destroy    (gpointer          user_data);
++static gboolean     panel_window_autohide_ease_in                     (gpointer          data);
++static void         panel_window_autohide_ease_in_timeout_destroy     (gpointer          user_data);
+ static void         panel_window_autohide_queue                       (PanelWindow      *window,
+                                                                        AutohideState     new_state);
+ static void         panel_window_opacity_enter_queue                  (PanelWindow      *window,
+@@ -341,6 +343,9 @@ struct _PanelWindow
+   AutohideState        autohide_state;
+   guint                autohide_timeout_id;
+   guint                autohide_ease_out_id;
++  gdouble              autohide_ease_in_progress;
++  guint                autohide_ease_in_id;
++  gboolean             autohide_ease_in_reverse;
+   guint                opacity_timeout_id;
+   gint                 autohide_block;
+   gint                 autohide_size;
+@@ -586,6 +591,9 @@ panel_window_init (PanelWindow *window)
+   window->autohide_state = AUTOHIDE_VISIBLE;
+   window->autohide_timeout_id = 0;
+   window->autohide_ease_out_id = 0;
++  window->autohide_ease_in_id = 0;
++  window->autohide_ease_in_progress = 0.0;
++  window->autohide_ease_in_reverse = FALSE;
+   window->opacity_timeout_id = 0;
+   window->autohide_block = 0;
+   window->autohide_size = DEFAULT_AUTOHIDE_SIZE;
+@@ -1005,40 +1013,66 @@ panel_window_delete_event (GtkWidget   *widget,
+   return TRUE;
+ }
+ 
+-
+-
+ static gboolean
+ panel_window_enter_notify_event (GtkWidget        *widget,
+                                  GdkEventCrossing *event)
+ {
+   PanelWindow *window = PANEL_WINDOW (widget);
+ 
++  g_print ("[PANEL] ENTER PRINCIPAL: estado=%d snap=%d ease_in=%u ease_out=%u\n",
++           window->autohide_state,
++           window->snap_position,
++           window->autohide_ease_in_id,
++           window->autohide_ease_out_id);
++
+   /* update autohide status */
+   if (event->detail != GDK_NOTIFY_INFERIOR
+       && window->autohide_block == 0)
+     {
+       panel_window_opacity_enter_queue (window, TRUE);
+-      if (window->autohide_behavior != AUTOHIDE_BEHAVIOR_NEVER)
+-        panel_window_autohide_queue (window, AUTOHIDE_VISIBLE);
++
++      if (window->autohide_behavior != AUTOHIDE_BEHAVIOR_NEVER
++          && window->autohide_ease_in_id == 0
++          && window->autohide_ease_out_id == 0)
++        {
++          g_print ("[PANEL] ENTER PRINCIPAL -> VISIBLE: "
++                   "ease_in=%u ease_out=%u\n",
++                   window->autohide_ease_in_id,
++                   window->autohide_ease_out_id);
++
++          panel_window_autohide_queue (window, AUTOHIDE_VISIBLE);
++        }
+     }
+ 
+   return FALSE;
+ }
+ 
+-
+-
+ static gboolean
+ panel_window_leave_notify_event (GtkWidget        *widget,
+-                                 GdkEventCrossing *event)
++                                  GdkEventCrossing *event)
+ {
++  PanelWindow *window = PANEL_WINDOW (widget);
++
+   if (event->detail != GDK_NOTIFY_INFERIOR)
+-    panel_window_drag_leave (widget, NULL, 0);
++    {
++      if (window->autohide_ease_in_id != 0)
++        {
++          window->autohide_ease_in_reverse = TRUE;
++
++          g_print ("[PANEL] LEAVE PRINCIPAL DURANTE EASE-IN: "
++                   "invertendo progresso=%.2f id=%u\\n",
++                   window->autohide_ease_in_progress,
++                   window->autohide_ease_in_id);
++        }
++      else
++        {
++          panel_window_drag_leave (widget, NULL, 0);
++        }
++    }
+ 
+   return FALSE;
+ }
+ 
+-
+-
+ static gboolean
+ panel_window_drag_motion (GtkWidget      *widget,
+                           GdkDragContext *context,
+@@ -1052,8 +1086,6 @@ panel_window_drag_motion (GtkWidget      *widget,
+   return TRUE;
+ }
+ 
+-
+-
+ static void
+ panel_window_drag_leave (GtkWidget      *widget,
+                          GdkDragContext *context,
+@@ -1073,11 +1105,19 @@ panel_window_drag_leave (GtkWidget      *widget,
+       if (window->autohide_behavior == AUTOHIDE_BEHAVIOR_INTELLIGENTLY)
+         panel_window_active_window_geometry_changed (window->wnck_active_window, window);
+       /* otherwise just hide the panel */
+-      else
+-        panel_window_autohide_queue (window, AUTOHIDE_POPDOWN_SLOW);
++  else if (window->autohide_ease_in_id == 0)
++    {
++      g_print ("[PANEL] POPDOWN_SLOW via 1092: "
++               "ease_in=%u ease_out=%u estado=%d snap=%d\n",
++               window->autohide_ease_in_id,
++               window->autohide_ease_out_id,
++               window->autohide_state,
++               window->snap_position);
++
++      panel_window_autohide_queue (window, AUTOHIDE_POPDOWN_SLOW);
+     }
+ }
+-
++}
+ 
+ 
+ static gboolean
+@@ -1453,19 +1493,32 @@ panel_window_size_allocate (GtkWidget     *widget,
+       panel_base_window_move_resize (PANEL_BASE_WINDOW (window->autohide_window),
+                                      x, y, w, h);
+ 
++      g_print ("[PANEL] AUTOHIDE WINDOW: snap=%d "
++               "area=%d,%d %dx%d "
++               "capture=%d,%d %dx%d "
++               "base=%d,%d\\n",
++               window->snap_position,
++               window->area.x,
++               window->area.y,
++               window->area.width,
++               window->area.height,
++               x, y, w, h,
++               window->base_x,
++               window->base_y);
++
+       /* slide out the panel window with popdown_speed, but ignore panels that are floating, i.e. not
+          attached to a GdkScreen border (i.e. including panels which are on a monitor border, but
+          at are at the same time between two monitors) */
+       if (IS_HORIZONTAL (window)
+-          && (((y + h) == panel_screen_get_height (window->screen))
+-               || (y == 0)))
++          && (((y + h) == window->area.y + window->area.height)
++               || (y == window->area.y)))
+         {
+           window->popdown_progress = window->alloc.height;
+           window->floating = FALSE;
+         }
+       else if (!IS_HORIZONTAL (window)
+-               && (((x + w) == panel_screen_get_width (window->screen))
+-                    || (x == 0)))
++               && (((x + w) == window->area.x + window->area.width)
++                    || (x == window->area.x)))
+         {
+           window->popdown_progress = window->alloc.width;
+           window->floating = FALSE;
+@@ -1474,12 +1527,21 @@ panel_window_size_allocate (GtkWidget     *widget,
+         window->floating = TRUE;
+ 
+       /* make the panel invisible without animation */
+-      if (window->floating
+-          || window->popdown_speed == 0)
++	
++	if (window->popdown_speed == 0)
+         {
+           /* cancel any pending animations */
+           if (window->autohide_ease_out_id != 0)
+-            g_source_remove (window->autohide_ease_out_id);
++            {
++              g_print ("[PANEL] SIZE_ALLOCATE CANCELANDO EASE-OUT: "
++                       "snap=%d floating=%d speed=%u id=%u\n",
++                       window->snap_position,
++                       window->floating,
++                       window->popdown_speed,
++                       window->autohide_ease_out_id);
++
++              g_source_remove (window->autohide_ease_out_id);
++            }
+ 
+           gtk_window_move (GTK_WINDOW (window), window->alloc.x, window->alloc.y);
+         }
+@@ -1504,7 +1566,9 @@ panel_window_size_allocate (GtkWidget     *widget,
+         panel_base_window_move_resize (PANEL_BASE_WINDOW (window->autohide_window),
+                                        -9999, -9999, -1, -1);
+ 
+-      gtk_window_move (GTK_WINDOW (window), window->alloc.x, window->alloc.y);
++      if (window->autohide_ease_in_id == 0)
++        gtk_window_move (GTK_WINDOW (window), window->alloc.x, window->alloc.y);
++
+     }
+ 
+   child = gtk_bin_get_child (GTK_BIN (widget));
+@@ -2442,11 +2506,25 @@ panel_window_active_window_geometry_changed (WnckWindow  *active_window,
+                   /* check if the cursor is outside the panel area before proceeding */
+                   gdk_device_get_position (device, NULL, &pointer_x, &pointer_y);
+                   if (pointer_x <= panel_area.x
+-                      || pointer_y <= panel_area.y
+-                      || pointer_x >= panel_area.x + panel_area.width
+-                      || pointer_y >= panel_area.y + panel_area.height)
+-                    panel_window_autohide_queue (window, AUTOHIDE_POPDOWN);
+-                }
++   		      || pointer_y <= panel_area.y
++    		      || pointer_x >= panel_area.x + panel_area.width
++   		      || pointer_y >= panel_area.y + panel_area.height)
++  		   {
++    		     g_print ("[PANEL] POPDOWN via 2480: "
++                     "pointer=%d,%d panel=%d,%d %dx%d "
++                     "ease_in=%u ease_out=%u snap=%d\n",
++                     pointer_x,
++                     pointer_y,
++                     panel_area.x,
++                     panel_area.y,
++                     panel_area.width,
++                     panel_area.height,
++                     window->autohide_ease_in_id,
++                     window->autohide_ease_out_id,
++                     window->snap_position);
++
++    panel_window_autohide_queue (window, AUTOHIDE_POPDOWN);
++  }
+             }
+           else
+             {
+@@ -2461,9 +2539,9 @@ panel_window_active_window_geometry_changed (WnckWindow  *active_window,
+           if (window->autohide_state != AUTOHIDE_VISIBLE)
+             panel_window_autohide_queue (window, AUTOHIDE_VISIBLE);
+         }
++      }
+     }
+-}
+-
++  }
+ 
+ 
+ static void
+@@ -2478,39 +2556,78 @@ panel_window_active_window_state_changed (WnckWindow  *active_window,
+     panel_window_active_window_geometry_changed (active_window, window);
+ }
+ 
+-
+-
+ static gboolean
+ panel_window_autohide_timeout (gpointer user_data)
+ {
+   PanelWindow *window = PANEL_WINDOW (user_data);
++ 
++  g_print ("[PANEL] TIMEOUT: estado=%d snap=%d floating=%d speed=%u progress=%d ease_in=%u ease_out=%u\n",
++         window->autohide_state,
++         window->snap_position,
++         window->floating,
++         window->popdown_speed,
++         window->popdown_progress,
++         window->autohide_ease_in_id,
++         window->autohide_ease_out_id);
+ 
+   panel_return_val_if_fail (window->autohide_behavior != AUTOHIDE_BEHAVIOR_NEVER, FALSE);
+   panel_return_val_if_fail (window->autohide_block == 0, FALSE);
+ 
+-  /* update the status */
++  /* hiding */
+   if (window->autohide_state == AUTOHIDE_POPDOWN
+       || window->autohide_state == AUTOHIDE_POPDOWN_SLOW)
+-    window->autohide_state = AUTOHIDE_HIDDEN;
+-  else if (window->autohide_state == AUTOHIDE_POPUP)
+-    window->autohide_state = AUTOHIDE_VISIBLE;
++    {
++      window->autohide_state = AUTOHIDE_HIDDEN;
+ 
+-  /* move the windows around */
+-  gtk_widget_queue_resize (GTK_WIDGET (window));
++      if (window->popdown_progress == 0)
++        {
++          if (IS_HORIZONTAL (window))
++            window->popdown_progress = window->alloc.height;
++          else
++            window->popdown_progress = window->alloc.width;
++        }
++
++      gtk_widget_queue_resize (GTK_WIDGET (window));
+ 
+-  /* check whether the panel should be animated on autohide */
+-  if (window->floating == FALSE
+-      || window->popdown_speed > 0)
+-    window->autohide_ease_out_id =
++	if (window->floating == FALSE
++          || window->popdown_speed > 0)
++        {
++          window->autohide_ease_out_id =
+             g_timeout_add_full (G_PRIORITY_LOW, 25,
+                                 panel_window_autohide_ease_out, window,
+                                 panel_window_autohide_ease_out_timeout_destroy);
+ 
++          g_print ("[PANEL] EASE-OUT TIMER criado: snap=%d id=%u progress=%d floating=%d\n",
++                   window->snap_position,
++                   window->autohide_ease_out_id,
++                   window->popdown_progress,
++                   window->floating);
++        }
++
++    }
++
++  /* showing */
++  else if (window->autohide_state == AUTOHIDE_POPUP)
++    {
++      window->autohide_state = AUTOHIDE_VISIBLE;
++
++      window->autohide_ease_in_progress = 0.0;
++      window->autohide_ease_in_reverse = FALSE;
++
++      gtk_widget_queue_resize (GTK_WIDGET (window));
++
++      window->autohide_ease_in_id =
++        g_timeout_add_full (G_PRIORITY_LOW, 25,
++                            panel_window_autohide_ease_in, window,
++                            panel_window_autohide_ease_in_timeout_destroy);
++	g_print ("[PANEL] EASE-IN TIMER criado: id=%u\n",
++         	  window->autohide_ease_in_id);
++    }
++
+   return FALSE;
+ }
+ 
+ 
+-
+ static void
+ panel_window_autohide_timeout_destroy (gpointer user_data)
+ {
+@@ -2529,12 +2646,153 @@ panel_window_cubic_ease_out (guint p)
+   return f * f * f + 1;
+ }
+ 
++static gboolean
++panel_window_autohide_ease_in (gpointer data)
++{
++  PanelWindow *window = PANEL_WINDOW (data);
++
++  gint x, y;
++  gint target_x, target_y;
++  gint hidden_x, hidden_y;
++  gdouble progress;
++  gdouble eased;
++
++  if (window->autohide_ease_in_reverse)
++    {
++      window->autohide_ease_in_progress -= 0.08;
++
++      if (window->autohide_ease_in_progress <= 0.0)
++        {
++          window->autohide_ease_in_progress = 0.0;
++
++          hidden_x = window->alloc.x;
++          hidden_y = window->alloc.y;
++
++          if (IS_HORIZONTAL (window))
++            {
++              if (window->snap_position == SNAP_POSITION_N
++                  || window->snap_position == SNAP_POSITION_NC
++                  || window->snap_position == SNAP_POSITION_NW
++                  || window->snap_position == SNAP_POSITION_NE)
++                hidden_y -= window->alloc.height;
++              else
++                hidden_y += window->alloc.height;
++            }
++          else
++            {
++              if (window->snap_position == SNAP_POSITION_W
++                  || window->snap_position == SNAP_POSITION_WC
++                  || window->snap_position == SNAP_POSITION_NW
++                  || window->snap_position == SNAP_POSITION_SW)
++                hidden_x -= window->alloc.width;
++              else
++                hidden_x += window->alloc.width;
++            }
++
++          gtk_window_move (GTK_WINDOW (window), hidden_x, hidden_y);
++
++          window->autohide_state = AUTOHIDE_HIDDEN;
++
++          /* Reposiciona a janela de captura do autohide na borda. */
++          gtk_widget_queue_resize (GTK_WIDGET (window));
++          window->autohide_ease_in_id = 0;
++          window->autohide_ease_in_reverse = FALSE;
++
++          g_print ("[PANEL] EASE-IN REVERSO: terminou oculto em %d,%d\n",
++                   hidden_x, hidden_y);
++
++          return FALSE;
++        }
++    }
++  else
++    {
++      window->autohide_ease_in_progress += 0.08;
++
++      if (window->autohide_ease_in_progress >= 1.0)
++        {
++          window->autohide_ease_in_progress = 1.0;
++
++          gtk_window_move (GTK_WINDOW (window),
++                           window->alloc.x,
++                           window->alloc.y);
++
++          window->autohide_ease_in_id = 0;
++          window->autohide_ease_in_reverse = FALSE;
++
++          g_print ("[PANEL] EASE-IN: terminou visível\n");
++
++          return FALSE;
++        }
++    }
++
++  progress = window->autohide_ease_in_progress;
++
++  eased = 1.0 - ((1.0 - progress)
++                 * (1.0 - progress)
++                 * (1.0 - progress));
++
++  target_x = window->alloc.x;
++  target_y = window->alloc.y;
++
++  if (IS_HORIZONTAL (window))
++    {
++      if (window->snap_position == SNAP_POSITION_N
++          || window->snap_position == SNAP_POSITION_NC
++          || window->snap_position == SNAP_POSITION_NW
++          || window->snap_position == SNAP_POSITION_NE)
++        {
++          y = target_y - window->alloc.height
++              + (gint) (window->alloc.height * eased);
++        }
++      else
++        {
++          y = target_y + window->alloc.height
++              - (gint) (window->alloc.height * eased);
++        }
++
++      x = target_x;
++    }
++  else
++    {
++      if (window->snap_position == SNAP_POSITION_W
++          || window->snap_position == SNAP_POSITION_WC
++          || window->snap_position == SNAP_POSITION_NW
++          || window->snap_position == SNAP_POSITION_SW)
++        {
++          x = target_x - window->alloc.width
++              + (gint) (window->alloc.width * eased);
++        }
++      else
++        {
++          x = target_x + window->alloc.width
++              - (gint) (window->alloc.width * eased);
++        }
++
++      y = target_y;
++    }
++
++  g_print ("[PANEL] EASE-IN %s: progresso=%.2f move=%d,%d\n",
++           window->autohide_ease_in_reverse ? "REVERSO" : "normal",
++           progress,
++           x, y);
++
++  gtk_window_move (GTK_WINDOW (window), x, y);
++
++  return TRUE;
++}
+ 
+ 
+ static gboolean
+ panel_window_autohide_ease_out (gpointer data)
+ {
+   PanelWindow  *window = PANEL_WINDOW (data);
++
++  g_print ("[PANEL] EASE-OUT: snap=%d progress=%d speed=%u floating=%d\n",
++           window->snap_position,
++           window->popdown_progress,
++           window->popdown_speed,
++           window->floating);
++
+   gint          x, y, w, h, progress;
+   gboolean      ret = TRUE;
+ 
+@@ -2544,62 +2802,146 @@ panel_window_autohide_ease_out (gpointer data)
+   gtk_window_get_position (GTK_WINDOW (window), &x, &y);
+   w = panel_screen_get_width (window->screen);
+   h = panel_screen_get_height (window->screen);
++  /*
++   * Identify the panel's monitor using its stable base position.
++   * The panel itself may move outside the monitor during the animation,
++   * so using gtk_window_get_position() here is unreliable.
++   */
++  GdkMonitor *monitor =
++    gdk_display_get_monitor_at_point (window->display,
++                                      window->base_x,
++                                      window->base_y);
++  GdkRectangle monitor_geometry = { 0 };
++
++  if (monitor != NULL)
++    {
++      gdk_monitor_get_geometry (monitor, &monitor_geometry);
++
++      g_print ("[PANEL] MONITOR EASE-OUT: painel=%d,%d "
++               "monitor=%d,%d %dx%d base=%d,%d\n",
++               x, y,
++               monitor_geometry.x,
++               monitor_geometry.y,
++               monitor_geometry.width,
++               monitor_geometry.height,
++               window->base_x,
++               window->base_y);
++    }
+ 
+   if (IS_HORIZONTAL (window))
+     {
+-      progress = panel_window_cubic_ease_out (window->alloc.height - window->popdown_progress) / window->popdown_speed;
+-      if (window->snap_position == SNAP_POSITION_N || window->snap_position == SNAP_POSITION_NC
+-          || window->snap_position == SNAP_POSITION_NW || window->snap_position == SNAP_POSITION_NE)
++      progress =
++        panel_window_cubic_ease_out (window->alloc.height
++                                     - window->popdown_progress)
++        / window->popdown_speed;
++
++      if (window->snap_position == SNAP_POSITION_N
++          || window->snap_position == SNAP_POSITION_NC
++          || window->snap_position == SNAP_POSITION_NW
++          || window->snap_position == SNAP_POSITION_NE)
+         {
+           y -= progress;
+ 
+-          if (y < 0 - window->alloc.height)
+-            ret = FALSE;
++          if (monitor != NULL
++              && y <= monitor_geometry.y - window->alloc.height)
++            {
++              y = monitor_geometry.y - window->alloc.height;
++              ret = FALSE;
++            }
++          else if (monitor == NULL
++                   && y < 0 - window->alloc.height)
++            {
++              ret = FALSE;
++            }
+         }
+-      else if (window->snap_position == SNAP_POSITION_S || window->snap_position == SNAP_POSITION_SC
+-               || window->snap_position == SNAP_POSITION_SW || window->snap_position == SNAP_POSITION_SE)
++      else if (window->snap_position == SNAP_POSITION_S
++               || window->snap_position == SNAP_POSITION_SC
++               || window->snap_position == SNAP_POSITION_SW
++               || window->snap_position == SNAP_POSITION_SE)
+         {
+           y += progress;
+ 
+-          if (y > h + window->alloc.height)
+-            ret = FALSE;
++          if (monitor != NULL
++              && y >= monitor_geometry.y + monitor_geometry.height)
++            {
++              y = monitor_geometry.y + monitor_geometry.height;
++              ret = FALSE;
++            }
++          else if (monitor == NULL
++                   && y > h + window->alloc.height)
++            {
++              ret = FALSE;
++            }
+         }
+     }
+   else
+     {
+-      progress = panel_window_cubic_ease_out (window->alloc.width - window->popdown_progress) / window->popdown_speed;
+-      if (window->snap_position == SNAP_POSITION_W || window->snap_position == SNAP_POSITION_WC
+-          || window->snap_position == SNAP_POSITION_NW || window->snap_position == SNAP_POSITION_SW)
++      progress =
++        panel_window_cubic_ease_out (window->alloc.width
++                                     - window->popdown_progress)
++        / window->popdown_speed;
++
++      if (window->snap_position == SNAP_POSITION_W
++          || window->snap_position == SNAP_POSITION_WC
++          || window->snap_position == SNAP_POSITION_NW
++          || window->snap_position == SNAP_POSITION_SW)
+         {
+           x -= progress;
+ 
+-          if (x < 0 - window->alloc.width)
+-            ret = FALSE;
++          if (monitor != NULL
++              && x <= monitor_geometry.x - window->alloc.width)
++            {
++              x = monitor_geometry.x - window->alloc.width;
++              ret = FALSE;
++            }
++          else if (monitor == NULL
++                   && x < 0 - window->alloc.width)
++            {
++              ret = FALSE;
++            }
+         }
+-      else if (window->snap_position == SNAP_POSITION_E || window->snap_position == SNAP_POSITION_EC
+-               || window->snap_position == SNAP_POSITION_NE || window->snap_position == SNAP_POSITION_SE)
++      else if (window->snap_position == SNAP_POSITION_E
++               || window->snap_position == SNAP_POSITION_EC
++               || window->snap_position == SNAP_POSITION_NE
++               || window->snap_position == SNAP_POSITION_SE)
+         {
+           x += progress;
+ 
+-          if (x > (w + window->alloc.width))
+-            ret = FALSE;
++          if (monitor != NULL
++              && x >= monitor_geometry.x + monitor_geometry.width)
++            {
++              x = monitor_geometry.x + monitor_geometry.width;
++              ret = FALSE;
++            }
++          else if (monitor == NULL
++                   && x > (w + window->alloc.width))
++            {
++              ret = FALSE;
++            }
+         }
+     }
+ 
+   window->popdown_progress--;
++
++  g_print ("[PANEL] EASE-OUT MOVE: x=%d y=%d progress=%d\n",
++           x, y, window->popdown_progress);
++
+   gtk_window_move (GTK_WINDOW (window), x, y);
+ 
+   return ret;
+ }
+ 
+-
+-
+ static void
+ panel_window_autohide_ease_out_timeout_destroy (gpointer user_data)
+ {
+   PANEL_WINDOW (user_data)->autohide_ease_out_id = 0;
+ }
+ 
++static void
++panel_window_autohide_ease_in_timeout_destroy (gpointer user_data)
++{
++  PANEL_WINDOW (user_data)->autohide_ease_in_id = 0;
++}
+ 
+ 
+ static void
+@@ -2614,12 +2956,53 @@ panel_window_autohide_queue (PanelWindow   *window,
+   if (window->autohide_timeout_id != 0)
+     g_source_remove (window->autohide_timeout_id);
+ 
+-  if (window->autohide_ease_out_id != 0)
++  if (new_state == AUTOHIDE_POPUP
++    && window->autohide_ease_out_id != 0)
++  {
++    g_print ("[PANEL] POPUP ignorado durante EASE-OUT: "
++             "snap=%d ease_out=%u\n",
++             window->snap_position,
++             window->autohide_ease_out_id);
++    return;
++  }
++
++  if (window->autohide_ease_out_id != 0
++    && new_state != AUTOHIDE_POPUP)
++  {
++    g_print ("[PANEL] EASE-OUT sendo removido: id=%u novo_estado=%d\n",
++             window->autohide_ease_out_id,
++             new_state);
+     g_source_remove (window->autohide_ease_out_id);
++  }
++
++  if (window->autohide_ease_in_id != 0
++      && new_state != AUTOHIDE_VISIBLE)
++    {
++      g_print ("[PANEL] EASE-IN sendo removido: id=%u\n",
++               window->autohide_ease_in_id);
++      g_source_remove (window->autohide_ease_in_id);
++    }
+ 
+   /* set new autohide state */
+   window->autohide_state = new_state;
+ 
++  g_print ("[PANEL] autohide_queue: estado=%d snap=%d alloc=%dx%d+%d+%d ease_in=%u ease_out=%u\n",
++         new_state,
++         window->snap_position,
++         window->alloc.width,
++         window->alloc.height,
++         window->alloc.x,
++         window->alloc.y,
++         window->autohide_ease_in_id,
++         window->autohide_ease_out_id);
++
++  g_print ("[PANEL] QUEUE CHAMADA: novo_estado=%d snap=%d estado_anterior=%d ease_in=%u ease_out=%u\n",
++         new_state,
++         window->snap_position,
++         window->autohide_state,
++         window->autohide_ease_in_id,
++         window->autohide_ease_out_id);
++
+   /* already hidden */
+   if (new_state == AUTOHIDE_HIDDEN)
+     return;
+@@ -2727,14 +3110,71 @@ panel_window_autohide_event (GtkWidget        *widget,
+                              GdkEventCrossing *event,
+                              PanelWindow      *window)
+ {
++
++  gint real_x, real_y;
++
++  gtk_window_get_position (GTK_WINDOW (widget), &real_x, &real_y);
++
++  g_print ("[PANEL] WIDGET EVENT: widget=%p window=%p "
++           "real_pos=%d,%d autohide_window=%p\n",
++           widget,
++           window,
++           real_x,
++           real_y,
++           window->autohide_window);
++
++  gint event_x, event_y;
++
++  gtk_window_get_position (GTK_WINDOW (window), &event_x, &event_y);
++
++  g_print ("[PANEL] AUTOHIDE EVENT: snap=%d state=%d "
++           "alloc=%dx%d+%d+%d window_pos=%d,%d "
++           "event=%.0f,%.0f detail=%d\n",
++           window->snap_position,
++           window->autohide_state,
++           window->alloc.width,
++           window->alloc.height,
++           window->alloc.x,
++           window->alloc.y,
++           event_x,
++           event_y,
++           event->x,
++           event->y,
++           event->detail);
++
+   panel_return_val_if_fail (PANEL_IS_WINDOW (window), FALSE);
+   panel_return_val_if_fail (window->autohide_window == widget, FALSE);
+ 
++  g_print ("[PANEL] evento autohide: %s snap=%d estado=%d "
++         "alloc=%dx%d+%d+%d ease_in=%u ease_out=%u "
++         "event=%.0f,%.0f detail=%d\n",
++         event->type == GDK_ENTER_NOTIFY ? "ENTROU" : "SAIU",
++         window->snap_position,
++         window->autohide_state,
++         window->alloc.width,
++         window->alloc.height,
++         window->alloc.x,
++         window->alloc.y,
++         window->autohide_ease_in_id,
++         window->autohide_ease_out_id,
++         event->x,
++         event->y,
++         event->detail);
++
++  g_print ("[PANEL] chamando autohide_queue com estado=%d\n",
++         event->type == GDK_ENTER_NOTIFY ? AUTOHIDE_POPUP : AUTOHIDE_HIDDEN);
++
+   if (event->type == GDK_ENTER_NOTIFY)
+     panel_window_autohide_queue (window, AUTOHIDE_POPUP);
+-  else
++  else if (window->autohide_ease_in_id == 0)
+     panel_window_autohide_drag_leave (widget, NULL, 0, window);
+-
++  else if (window->autohide_ease_in_id == 0)
++    panel_window_autohide_drag_leave (widget, NULL, 0, window);
++  else
++    g_print ("[PANEL] AUTOHIDE WINDOW LEAVE IGNORADO: "
++             "EASE-IN ativo id=%u\\n",
++             window->autohide_ease_in_id);
++  
+   return FALSE;
+ }
+ 
+@@ -3394,12 +3834,20 @@ panel_window_thaw_autohide (PanelWindow *window)
+         panel_window_active_window_geometry_changed (window->wnck_active_window, window);
+       /* otherwise hide the panel if the pointer is outside */
+       else if (outside)
+-        panel_window_autohide_queue (window, AUTOHIDE_POPDOWN);
++        {
++          g_print ("[PANEL] POPDOWN via 3714: outside=%d "
++                   "ease_in=%u ease_out=%u snap=%d\n",
++                   outside,
++                   window->autohide_ease_in_id,
++                   window->autohide_ease_out_id,
++                   window->snap_position);
++
++          panel_window_autohide_queue (window, AUTOHIDE_POPDOWN);
++        }
+     }
+ }
+ 
+ 
+-
+ void
+ panel_window_set_locked (PanelWindow *window,
+                          gboolean     locked)

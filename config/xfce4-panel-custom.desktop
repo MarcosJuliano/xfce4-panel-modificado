@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=XFCE Panel Custom
+Comment=XFCE Panel 4.18.4 customizado
+Exec=/usr/local/bin/xfce4-panel
+Terminal=false
+OnlyShowIn=XFCE;
+X-GNOME-Autostart-enabled=true
